@@ -1,0 +1,213 @@
+import os
+import random
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+from torch import nn
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+# -------------------- 配置参数 --------------------
+SEED = 42
+DAYS_FOR_TRAIN = 10
+EPOCHS = 200
+LR = 1e-3
+TRANS_D_MODEL = 64
+TRANS_HEADS = 4
+TRANS_LAYERS = 2
+LSTM_HIDDEN = 64
+OUT_DIR = "."
+PATIENCE = 20  # 早停轮数
+os.makedirs(OUT_DIR, exist_ok=True)
+
+
+# -------------------- 设置随机种子 --------------------
+def set_seed(seed=SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+set_seed()
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# -------------------- 读取 CSV --------------------
+file_path = r"cleaned_data.csv"
+df = pd.read_csv(file_path)
+df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce", utc=True)
+df["datetime"] = df["datetime"].dt.tz_localize(None)
+
+# -------------------- 数据选择与归一化 --------------------
+features = ["bid_price", "bid_order_qty", "bid_executed_qty", "ask_order_qty", "ask_executed_qty"]
+target_col = "ask_executed_qty"
+df_features = df[["datetime"] + features].dropna().reset_index(drop=True)
+
+scaler = MinMaxScaler()
+data = scaler.fit_transform(df_features[features].values)
+
+
+def create_dataset(data, window, target_index):
+    X, Y = [], []
+    for i in range(len(data) - window):
+        X.append(data[i:i + window])
+        Y.append(data[i + window, target_index])
+    return np.array(X), np.array(Y)
+
+
+X, Y = create_dataset(data, DAYS_FOR_TRAIN, features.index(target_col))
+X_tensor = torch.tensor(X, dtype=torch.float32).to(device)
+Y_tensor = torch.tensor(Y, dtype=torch.float32).view(-1, 1).to(device)
+dates = df_features["datetime"].values[DAYS_FOR_TRAIN:]
+
+
+# -------------------- 评估函数 --------------------
+def evaluate_metrics(y_true, y_pred):
+    mse = mean_squared_error(y_true, y_pred)
+    mae = mean_absolute_error(y_true, y_pred)
+    mape = np.mean(np.abs((y_true - y_pred) / (y_true + 1e-8))) * 100
+    r2 = r2_score(y_true, y_pred)
+    return mse, mae, mape, r2
+
+
+# -------------------- 模型定义 --------------------
+class LearnablePositionalEmbedding(nn.Module):
+    def __init__(self, seq_len, d_model):
+        super().__init__()
+        self.pos_embed = nn.Parameter(torch.randn(1, seq_len, d_model) * 0.01)
+
+    def forward(self, x):
+        return x + self.pos_embed[:, :x.size(1), :]
+
+
+class FusionLSTMTransformer(nn.Module):
+    def __init__(self, input_dim, lstm_hidden=LSTM_HIDDEN, trans_d=TRANS_D_MODEL,
+                 trans_heads=TRANS_HEADS, trans_layers=TRANS_LAYERS, seq_len=DAYS_FOR_TRAIN):
+        super().__init__()
+        self.lstm = nn.LSTM(input_dim, lstm_hidden, num_layers=2, batch_first=True)
+        self.input_proj = nn.Linear(input_dim, trans_d)
+        self.pos_emb = LearnablePositionalEmbedding(seq_len, trans_d)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=trans_d, nhead=trans_heads,
+            dim_feedforward=trans_d * 4, batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=trans_layers)
+        self.fc_fusion = nn.Sequential(
+            nn.Linear(lstm_hidden + trans_d, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        )
+
+    def forward(self, x):
+        lstm_out, _ = self.lstm(x)
+        lstm_last = lstm_out[:, -1, :]
+        t = self.input_proj(x)
+        t = self.pos_emb(t)
+        t_out = self.transformer(t)
+        t_last = t_out[:, -1, :]
+        fused = torch.cat([lstm_last, t_last], dim=-1)
+        out = self.fc_fusion(fused)
+        return out
+
+
+# -------------------- 训练模型（带早停机制） --------------------
+input_dim = len(features)
+model = FusionLSTMTransformer(input_dim=input_dim).to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+criterion = nn.MSELoss()
+
+losses = []
+best_loss = float('inf')
+counter = 0
+
+for epoch in range(EPOCHS):
+    model.train()
+    pred = model(X_tensor)
+    loss = criterion(pred, Y_tensor)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    losses.append(loss.item())
+
+    # 早停判断
+    if loss.item() < best_loss:
+        best_loss = loss.item()
+        counter = 0
+        torch.save(model.state_dict(), os.path.join(OUT_DIR, "best_model.pth"))
+    else:
+        counter += 1
+        if counter >= PATIENCE:
+            print(f"⚠️ Early stopping at epoch {epoch + 1}")
+            break
+
+    if (epoch + 1) % 20 == 0:
+        print(f"[Fusion] Epoch {epoch + 1}/{EPOCHS}, Loss: {loss.item():.6f}")
+
+# 加载最优模型参数
+model.load_state_dict(torch.load(os.path.join(OUT_DIR, "best_model.pth")))
+
+plt.plot(losses)
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.title("Fusion Model Training Loss")
+plt.savefig(os.path.join(OUT_DIR, "loss_fusion.png"))
+plt.close()
+
+# -------------------- 预测 --------------------
+model.eval()
+with torch.no_grad():
+    y_pred = model(X_tensor).cpu().numpy()
+
+# 反归一化
+y_pred_full = np.zeros((len(y_pred), len(features)))
+y_pred_full[:, features.index(target_col)] = y_pred.flatten()
+y_true_full = np.zeros((len(Y_tensor), len(features)))
+y_true_full[:, features.index(target_col)] = Y_tensor.cpu().numpy().flatten()
+
+y_pred_inv = scaler.inverse_transform(y_pred_full)[:, features.index(target_col)]
+y_true_inv = scaler.inverse_transform(y_true_full)[:, features.index(target_col)]
+
+# -------------------- 评估 --------------------
+mse, mae, mape, r2 = evaluate_metrics(y_true_inv, y_pred_inv)
+print("\n📈 Fusion Model Evaluation:")
+print(f" - MSE  : {mse:.6f}")
+print(f" - MAE  : {mae:.6f}")
+print(f" - MAPE : {mape:.4f}%")
+print(f" - R²   : {r2:.6f}")
+
+plt.figure(figsize=(12, 4))
+plt.plot(y_true_inv, label="True")
+plt.plot(y_pred_inv, label="Predicted")
+plt.legend()
+plt.title("Fusion Model Prediction")
+plt.savefig(os.path.join(OUT_DIR, "prediction_fusion.png"))
+plt.close()
+
+# -------------------- 自适应分位数异常检测 --------------------
+residuals = y_true_inv - y_pred_inv
+lower, upper = np.percentile(residuals, 1), np.percentile(residuals, 99)
+anoms = ((residuals < lower) | (residuals > upper)).astype(int)
+
+plt.figure(figsize=(12, 4))
+plt.plot(y_true_inv, label="True")
+plt.plot(y_pred_inv, label="Predicted")
+plt.scatter(np.where(anoms == 1)[0], y_true_inv[anoms == 1], color='red', marker='x', label='Anomaly')
+plt.legend()
+plt.title("Detected Anomalies (Adaptive Quantile)")
+plt.savefig(os.path.join(OUT_DIR, "anomaly_visualization.png"))
+plt.close()
+
+# -------------------- 保存结果（仅保留指定列） --------------------
+df_out = df_features.iloc[DAYS_FOR_TRAIN:].copy()
+df_out["is_anomaly"] = anoms
+
+df_out_final = df_out[["datetime", "bid_price", "bid_order_qty",
+                       "bid_executed_qty", "ask_order_qty", "ask_executed_qty", "is_anomaly"]]
+
+df_out_final.to_csv(os.path.join(OUT_DIR, "anomaly_result.csv"), index=False)
+
+print("\n✅ 训练、预测及自适应分位数异常检测完成！结果保存在 anomaly_result.csv")
