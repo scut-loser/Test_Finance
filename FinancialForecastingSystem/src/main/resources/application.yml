@@ -1,0 +1,46 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: financial-forecasting-system
+  datasource:
+    url: jdbc:mysql://localhost:3306/financial_forecasting?createDatabaseIfNotExist=true&useUnicode=true&characterEncoding=utf8&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai
+    username: fin
+    password: fin123
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+        dialect: org.hibernate.dialect.MySQL8Dialect
+
+# 算法配置
+financial:
+  algorithm:
+  # local-model-path： models/local_model.py
+    local-model-path: models/labeled_anomaly_detection.py
+    secondary-model-path: models/prediction_quantile_detection.py
+    local-data-file: cleaned_data.csv
+    python-exec: python
+    prediction-window: 30
+    anomaly-threshold: 0.95
+    default-feature: bid_price
+    cloud-model-url: http://localhost:8082/algorithms/predict #云端 待完善
+
+
+# 日志配置
+logging:
+  level:
+    com.financial: DEBUG
+    org.springframework.web: INFO
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
+    file: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
+  file:
+    name: logs/financial-forecasting.log
+    max-size: 100MB
+    max-history: 30
